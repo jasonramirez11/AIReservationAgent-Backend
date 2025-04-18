@@ -19,6 +19,7 @@ from twilio.twiml.voice_response import VoiceResponse, Say, Gather, Pause
 import httpx
 from fastapi.responses import Response, JSONResponse
 import logging  # Add at top with other imports
+from fastapi.middleware.cors import CORSMiddleware
 
 # Load environment variables
 load_dotenv()
