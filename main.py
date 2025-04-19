@@ -33,7 +33,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-        "https://ai-reservation-agent-frontend-zy17.vercel.app"
+        "https://ai-reservation-agent-frontend.vercel.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
