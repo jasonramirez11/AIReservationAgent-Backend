@@ -14,15 +14,5 @@
     ],
     "env": {
       "PYTHONUNBUFFERED": "1"
-    },
-    "functions": {
-      "api/call-response": {
-        "memory": 1024,
-        "maxDuration": 10
-      },
-      "api/call-status": {
-        "memory": 1024,
-        "maxDuration": 10
-      }
     }
   }
