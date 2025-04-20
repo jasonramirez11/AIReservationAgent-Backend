@@ -40,7 +40,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -56,14 +55,13 @@ twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # Initialize LLM using OpenAI
 llm = ChatOpenAI(
-    model="gpt-4.1",
-    temperature=0.4,
+    model="gpt-4o",
+    temperature=0.3,
     api_key=os.getenv("OPENAI_API_KEY")
 )
 
 def get_base_url():
     """Get the base URL for webhook callbacks"""
-    # Get from environment variable with fallback
     return os.getenv("SERVER_URL", "http://localhost:8000")
 
 # Store active reservations in memory (for demo purposes)
@@ -256,7 +254,7 @@ def create_conversation_graph():
 
         # Create system message with guidelines, asking for JSON output
         system_content = f"""
-        You are a warm, friendly, and professional AI assistant making a restaurant reservation by phone. You need to respond appropriately to what the restaurant staff says.
+        You are a warm, friendly, and professional AI assistant making a restaurant reservation by phone.
 
         Reservation details:
         - Restaurant: {state["restaurant_name"]}
@@ -295,17 +293,40 @@ def create_conversation_graph():
         - The "finalizing" stage is for handling any final details after the initial confirmation
         - The "end_call" stage indicates the conversation has reached its natural conclusion and it's appropriate to end the call
         - Only use "end_call" when all details are confirmed and there's nothing more to discuss
-    
         
-        Your output MUST be a valid JSON object containing exactly two fields: "response" (string) and "next_stage" (string, one of the valid stages above).
-        Provide ONLY the JSON object in your response, with no introductory text, explanations, or markdown formatting.
+        **CRITICAL OUTPUT FORMAT:**
+        Your *entire* response MUST be a single, valid JSON list containing exactly ONE JSON object.
+        Do NOT include any text before the opening bracket `[` or after the closing bracket `]`.
+        Do NOT use markdown code fences (```json ... ```).
+        The JSON object inside the list MUST contain exactly two keys:
+        1. "response": (string) The exact text you should say to the restaurant staff.
+        2. "next_stage": (string) ONE of the following exact stage names: {json.dumps(valid_stages_list)}
 
-        Example JSON Output:
-        {{
-          "response": "Okay, great! So that's a table for 2 on Tuesday at 7 PM. Can I get a name for the reservation?",
-          "next_stage": "gathering_info"
-        }}
+         **CRITICAL OUTPUT FORMAT:**
+        Your *entire* response MUST be a single, valid JSON list containing exactly ONE JSON object.
+        Do NOT include any text before the opening bracket `[` or after the closing bracket `]`.
+        Do NOT use markdown code fences (```json ... ```).
+        The JSON object inside the list MUST contain exactly two keys:
+        1. "response": (string) The exact text you should say to the restaurant staff.
+        2. "next_stage": (string) ONE of the following exact stage names: {json.dumps(valid_stages_list)}
+
+        **Example of CORRECT output (JSON list with one object):**
+        [{{"response": "Okay, perfect.", "next_stage": "finalizing"}}]
+
+        **Example of INCORRECT output (Just the object):**
+        {{"response": "Okay, perfect.", "next_stage": "finalizing"}}
+
+        **Example of INCORRECT output (Markdown fences):**
+        ```json
+        [{{"response": "Okay, perfect.", "next_stage": "finalizing"}}]
+        ```
+        **Example of INCORRECT output (Extra text):**
+        Okay, here is the JSON list: [{{"response": "Sounds good.", "next_stage": "finalizing"}}]
+
+        **Example of INCORRECT output (Just response):**
+        "Sounds good."
         """
+        # --- End Adjusted System Prompt ---
 
         messages = [SystemMessage(content=system_content)] + state["messages"]
 
@@ -325,8 +346,9 @@ def create_conversation_graph():
                 if response_text.startswith("```json"):
                     response_text = re.sub(r"^```json\s*|\s*```$", "", response_text, flags=re.DOTALL)
                     logger.info(f"Stripped markdown fences, attempting parse: {response_text}")
-
-                llm_output_data = json.loads(response_text)
+                
+                response_text = response_text[response_text.find('['):response_text.rfind(']') + 1]
+                llm_output_data = json.loads(response_text)[0]
                 llm_response_obj = LLMResponse(**llm_output_data) # Validate structure and next_stage enum
 
                 ai_response = llm_response_obj.response
@@ -611,21 +633,53 @@ async def create_reservation(reservation_request: ReservationRequest, background
     4. Return the status of the reservation
     """
     reservation_id = str(uuid.uuid4())
-    
-    # Log new reservation request
-    logger.info(f"Creating reservation {reservation_id} for {reservation_request.restaurant_name} "
+
+    # Log original request details
+    logger.info(f"Received reservation request {reservation_id} for {reservation_request.restaurant_name} "
                 f"on {reservation_request.date} at {reservation_request.time} "
-                f"for {reservation_request.party_size} people")
-    
-    # Initialize reservation in memory
+                f"for {reservation_request.party_size} people. Raw phone: {reservation_request.phone_number}")
+
+    # Convert the Pydantic model to a dictionary to modify it safely
+    reservation_dict = reservation_request.dict()
+
+    # --- Phone Number Formatting Logic ---
+    raw_phone = reservation_dict.get("phone_number")
+    formatted_phone = raw_phone # Start with the original value
+
+    if raw_phone:
+        # Remove all non-digit characters
+        digits_only = re.sub(r'\D', '', raw_phone)
+
+        if len(digits_only) == 10:
+            # Assume 10 digits is a US/Canada number needing +1
+            formatted_phone = f"+1{digits_only}"
+            logger.info(f"Formatted 10-digit phone {raw_phone} to {formatted_phone} for reservation {reservation_id}")
+        elif len(digits_only) == 11 and digits_only.startswith('1'):
+            # Handle cases like 1XXXXXXXXXX -> +1XXXXXXXXXX
+            formatted_phone = f"+{digits_only}"
+            logger.info(f"Formatted 11-digit phone {raw_phone} to {formatted_phone} for reservation {reservation_id}")
+        elif digits_only.startswith('+'):
+             # Assume already formatted correctly if starts with +
+             formatted_phone = f"+{digits_only.lstrip('+')}" # Ensure only one +
+             logger.debug(f"Phone number {raw_phone} already seems E.164 formatted, keeping as {formatted_phone}")
+        else:
+            # Keep original if it doesn't match expected US formats
+             logger.warning(f"Phone number {raw_phone} for reservation {reservation_id} doesn't match 10/11 digit US format. Keeping original.")
+             formatted_phone = raw_phone # Explicitly keep original
+
+        # Update the dictionary with the potentially formatted number
+        reservation_dict["phone_number"] = formatted_phone
+    # --- End Phone Number Formatting Logic ---
+
+    # Initialize reservation in memory using the potentially modified dictionary
     active_reservations[reservation_id] = {
-        **reservation_request.dict(),
+        **reservation_dict,  # Use the dictionary with the formatted number
         "status": "processing"
     }
-    
-    # Start background processing
-    background_tasks.add_task(process_reservation, reservation_request.dict(), reservation_id)
-    
+
+    # Start background processing using the potentially modified dictionary
+    background_tasks.add_task(process_reservation, reservation_dict, reservation_id) # Pass the modified dict
+
     # Return immediate response
     return ReservationResponse(
         reservation_id=reservation_id,
