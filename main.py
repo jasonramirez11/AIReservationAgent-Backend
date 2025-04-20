@@ -5,9 +5,9 @@ import uuid
 import urllib.parse
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 from langchain.chains import LLMChain
 from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate, ChatPromptTemplate, MessagesPlaceholder
@@ -87,6 +87,13 @@ class ReservationResponse(BaseModel):
     message: str
     details: Optional[Dict[str, Any]] = None
 
+class LLMResponse(BaseModel):
+    response: str = Field(description="The spoken response to the restaurant staff.")
+    next_stage: Literal[
+        "confirmed", "rejected", "gathering_info", "considering_alternative",
+        "initial", "waiting", "finalizing", "end_call"
+    ] = Field(description="The next stage of the call.")
+
 # Helper function to fetch restaurant information using Perplexity API
 async def fetch_restaurant_info(restaurant_name: str):
     """Fetch restaurant information including phone number using Perplexity API"""
@@ -124,7 +131,7 @@ async def fetch_restaurant_info(restaurant_name: str):
 def create_langchain_workflow():
     """Creates a LangChain workflow for making reservation decisions"""
     template = """
-    You are an AI restaurant reservation agent. Your goal is to help make restaurant reservations.
+     You are a warm, friendly, and professional AI restaurant reservation agent. Your goal is to help make restaurant reservations.
     
     Restaurant Information:
     {restaurant_info}
@@ -148,7 +155,7 @@ def create_langchain_workflow():
     - Do NOT include all special requests, contact details, or excessive information in the opening
     - Do NOT use formal language like "I would like to inquire about" or "on behalf of"
     - Sound like a real person making a casual but polite call
-    - The script should be 2-3 short sentences maximum
+    - The script should be 1-3 short sentences maximum
     - Remember the AI will handle follow-up questions during the conversation
     
     Output your decision in the following format:
@@ -228,9 +235,7 @@ def create_conversation_graph():
     """Creates a LangGraph for handling restaurant conversation with persistent memory"""
     from langgraph.graph import START, StateGraph
 
-    # Create state schema for restaurant conversation
     class RestaurantConversationState(MessagesState):
-        # Additional context for the conversation
         restaurant_name: str
         date: str
         time: str
@@ -238,25 +243,30 @@ def create_conversation_graph():
         special_requests: str
         call_stage: str
         reservation_id: str
-    
-    # Create the graph
+
     workflow = StateGraph(state_schema=RestaurantConversationState)
-    
+
     # Define the function that calls the model
     def process_restaurant_response(state):
-        # Create system message with guidelines
+        # Valid stages list for prompt and validation
+        valid_stages_list = [
+            "confirmed", "rejected", "gathering_info", "considering_alternative",
+            "initial", "waiting", "finalizing", "end_call"
+        ]
+
+        # Create system message with guidelines, asking for JSON output
         system_content = f"""
         You are a warm, friendly, and professional AI assistant making a restaurant reservation by phone. You need to respond appropriately to what the restaurant staff says.
-        
+
         Reservation details:
         - Restaurant: {state["restaurant_name"]}
         - Date: {state["date"]}
         - Time: {state["time"]}
         - Party Size: {state["party_size"]}
         - Special Requests: {state["special_requests"]}
-        
+
         Current call stage: {state["call_stage"]}
-        
+
         Conversation guidelines:
         - Reference and acknowledge previous parts of the conversation when appropriate
         - Listen carefully to the staff and respond to their specific questions/concerns
@@ -269,11 +279,6 @@ def create_conversation_graph():
         - If they say they're fully booked, ask about alternative times/dates or thank them for their time
         - If they put you on hold or need to check something, acknowledge this when they return
         
-        Your response should be formatted as text that can be spoken by the AI phone system.
-        Output in the format:
-        Response: [your spoken response]
-        Next Stage: [next call stage]
-        
         Determine the next stage of the call based on the conversation:
         - If they initially confirmed the reservation, set stage to "confirmed"
         - If you're in the "confirmed" or "finalizing" stage and are still discussing details, set stage to "finalizing"
@@ -283,55 +288,79 @@ def create_conversation_graph():
         - If they suggested an alternative, set stage to "considering_alternative"
         - If they asked you to wait, set stage to "waiting"
         - Otherwise, keep the stage as is
+
+        The next stage MUST be one of the following exact strings: {json.dumps(valid_stages_list)}.
         
         Note: 
         - The "finalizing" stage is for handling any final details after the initial confirmation
         - The "end_call" stage indicates the conversation has reached its natural conclusion and it's appropriate to end the call
         - Only use "end_call" when all details are confirmed and there's nothing more to discuss
+    
+        
+        Your output MUST be a valid JSON object containing exactly two fields: "response" (string) and "next_stage" (string, one of the valid stages above).
+        Provide ONLY the JSON object in your response, with no introductory text, explanations, or markdown formatting.
+
+        Example JSON Output:
+        {{
+          "response": "Okay, great! So that's a table for 2 on Tuesday at 7 PM. Can I get a name for the reservation?",
+          "next_stage": "gathering_info"
+        }}
         """
-        
-        # Prepare all messages for the model
+
         messages = [SystemMessage(content=system_content)] + state["messages"]
-        
-        # Call the model
-        response = llm.invoke(messages)
-        
-        # Extract information from the response
-        response_text = response.content
-        
-        logger.info(f"Model response: {response_text}")
-        
-        # Parse the response with improved regex
-        response_match = re.search(r'Response:(.*?)(?:Next Stage:|$)', response_text, re.DOTALL)
-        stage_match = re.search(r'Next Stage:\s*(\w+)', response_text, re.DOTALL)
-        
-        ai_response = response_match.group(1).strip() if response_match else "I apologize, could you repeat that? I want to make sure I get your reservation details correctly."
-        
-        # Validate the next stage is one of the expected values
-        valid_stages = ["confirmed", "rejected", "gathering_info", "considering_alternative", "initial", "waiting", "finalizing", "end_call"]
-        extracted_stage = stage_match.group(1).strip() if stage_match else ""
-        next_stage = extracted_stage if extracted_stage in valid_stages else state["call_stage"]
-        
+
+        # Initialize default values in case of error
+        ai_response = "I apologize, I encountered a technical issue. Could you please repeat that?"
+        next_stage = state["call_stage"] # Default to current stage on error
+
+        for _ in range(3):
+            try:
+                # Call the model (consider adding retries specifically for JSON parsing if needed)
+                response = llm.invoke(messages)
+                response_text = response.content.strip()
+                logger.info(f"Raw model response: {response_text}")
+
+                # Attempt to parse the JSON output and validate with Pydantic
+                # Handle potential ```json ... ``` markdown fences
+                if response_text.startswith("```json"):
+                    response_text = re.sub(r"^```json\s*|\s*```$", "", response_text, flags=re.DOTALL)
+                    logger.info(f"Stripped markdown fences, attempting parse: {response_text}")
+
+                llm_output_data = json.loads(response_text)
+                llm_response_obj = LLMResponse(**llm_output_data) # Validate structure and next_stage enum
+
+                ai_response = llm_response_obj.response
+                next_stage = llm_response_obj.next_stage # Already validated by Pydantic
+                
+                if not ai_response or not next_stage:
+                    raise ValueError("LLM response missing ai_response or next_stage")
+                
+                logger.info(f"Successfully parsed JSON: response='{ai_response[:30]}...', next_stage='{next_stage}'")
+                break
+            except (json.JSONDecodeError, ValidationError, Exception) as e: # Catch JSON, Pydantic, and other errors
+                logger.error(f"Failed to parse/validate LLM JSON or other error: {e}", exc_info=True) # Log traceback
+                logger.error(f"LLM Raw Output causing error: {response_text}")
+
         # Log the stage transition
         logger.info(f"Stage transition: '{state['call_stage']}' -> '{next_stage}'")
-        
-        # Update the call stage
+
+        # Update the call stage in the new state
         new_state = state.copy()
         new_state["call_stage"] = next_stage
-        
-        # Add AI message to the conversation
+
+        # Add AI message to the conversation history
         new_state["messages"].append(AIMessage(content=ai_response))
-        
-        # Log the response
-        logger.info(f"AI response: {ai_response}")
-        logger.info(f"Next stage: {next_stage}")
-        
+
+        # Log the final response and stage being used
+        logger.info(f"Final AI response being used: {ai_response}")
+        logger.info(f"Final next stage being used: {next_stage}")
+
         return new_state
-    
+
     # Define the node and edge
     workflow.add_node("process_response", process_restaurant_response)
     workflow.add_edge(START, "process_response")
-    
+
     # Compile the graph with memory
     return workflow.compile(checkpointer=conversation_memory)
 
@@ -517,9 +546,9 @@ async def process_reservation(reservation_data: Dict[str, Any], reservation_id: 
         if "proceed with call" in decision_result.lower():
             conversation_strategy = strategy_match.group(1).strip() if strategy_match else ""
         
-        # Save the strategy to the reservation data for reference during the conversation
-        if conversation_strategy:
-            reservation_data["conversation_strategy"] = conversation_strategy
+            # Save the strategy to the reservation data for reference during the conversation
+            if conversation_strategy:
+                reservation_data["conversation_strategy"] = conversation_strategy
         
         # 3. Make the call if the decision is to proceed
         if "proceed with call" in decision_result.lower():
@@ -717,7 +746,6 @@ async def call_response(request: Request):
                 SystemMessage(content=f"Conversation Strategy: {reservation['conversation_strategy']}")
             )
         
-        # Add the human message
         initial_messages.append(HumanMessage(content=speech_result))
         
         # Create the initial state
@@ -732,7 +760,6 @@ async def call_response(request: Request):
             "reservation_id": reservation_id
         }
     else:
-        # For continuing conversations, add the new human message
         logger.info(f"Continuing conversation for reservation {reservation_id}, stage: {call_stage}")
         
         # Create input with just the new human message
