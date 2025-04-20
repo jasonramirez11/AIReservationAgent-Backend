@@ -61,6 +61,11 @@ llm = ChatOpenAI(
     api_key=os.getenv("OPENAI_API_KEY")
 )
 
+def get_base_url():
+    """Get the base URL for webhook callbacks"""
+    # Get from environment variable with fallback
+    return os.getenv("SERVER_URL", "http://localhost:8000")
+
 # Store active reservations in memory (for demo purposes)
 # In production, we'd need a proper database
 active_reservations = {}
@@ -293,6 +298,8 @@ def create_conversation_graph():
         
         # Extract information from the response
         response_text = response.content
+        
+        logger.info(f"Model response: {response_text}")
         
         # Parse the response with improved regex
         response_match = re.search(r'Response:(.*?)(?:Next Stage:|$)', response_text, re.DOTALL)
@@ -664,6 +671,10 @@ conversation_memory = MemorySaver()
 @app.post("/call-response")
 async def call_response(request: Request):
     """Handle the restaurant's response to the reservation call and use conversation memory."""
+    # Get base URL from request
+    base_url = get_base_url()
+    logger.info(f"Using base URL: {base_url}")
+    
     form_data = await request.form()
     speech_result = form_data.get("SpeechResult", "")
     
@@ -841,7 +852,7 @@ async def call_response(request: Request):
         # Set up another gather for continuing the conversation
         gather = Gather(
             input="speech", 
-            action=f"/call-response?{param_str}", 
+            action=f"{base_url}/call-response?{param_str}",
             method="POST",
             timeout=5,
             speechTimeout="auto"
